@@ -4,7 +4,7 @@ function info() {
   return {
     apiversion: "1",
     author: "MySurvivalSnake",
-    color: "#4287f5",
+    color: "#f5a742",
     head: "beluga",
     tail: "curled",
   };
@@ -51,6 +51,55 @@ const PARAMS = {
   FOOD_BASELINE_MULTIPLIER: 1, // baseline food interest even when healthy/long (never fully stop growing)
   MIN_SAFE_SPACE: 6,          // if the space behind a move is below this, food urgency is ignored
 };
+
+function isRoyale(gameState) {
+  return gameState.game?.ruleset?.name === "royale";
+}
+
+// Royale-specific overrides, merged over PARAMS when ruleset is "royale".
+// Rationale (from the mode description):
+//  - "storm shrinks the board turn by turn and deals damage" -> hazards must be
+//    avoided much more aggressively, and we should bias toward the safe zone's
+//    center (not just the board's static center) since that's where the zone
+//    keeps shrinking to.
+//  - "someone always gets cornered" -> weight open space/mobility higher and
+//    avoid tight pockets near board edges, since the storm eats edges first.
+//  - "matches stay fast" -> health drains faster (damage + normal decay), so
+//    food becomes urgent sooner and matters even at high length.
+//  - single elimination, no draws to fall back on -> be more conservative in
+//    50/50s; a fight loss ends the run, so danger avoidance gets extra weight.
+const ROYALE_OVERRIDES = {
+  SPACE_WEIGHT: 9,
+  TERRITORY_WEIGHT: 3,
+  HAZARD_PENALTY: 60,
+  MIN_LENGTH_ADVANTAGE: 3,
+  FOOD_URGENT_HEALTH: 65,
+  FOOD_URGENT_MULTIPLIER: 7,
+  MIN_SAFE_SPACE: 8,
+  SAFE_ZONE_BIAS_WEIGHT: 1.2, // pull toward the centroid of remaining non-hazard space
+};
+
+function getEffectiveParams(gameState) {
+  return isRoyale(gameState) ? { ...PARAMS, ...ROYALE_OVERRIDES } : PARAMS;
+}
+
+// Centroid of all currently-safe (non-hazard) board cells — this approximates
+// "where the shrinking storm is retreating to" far better than the board's
+// fixed geometric center, since the storm can shrink asymmetrically.
+function getSafeZoneCenter(boardWidth, boardHeight, hazardSet) {
+  let sumX = 0, sumY = 0, count = 0;
+  for (let x = 0; x < boardWidth; x++) {
+    for (let y = 0; y < boardHeight; y++) {
+      if (!hazardSet.has(coordKey(x, y))) {
+        sumX += x;
+        sumY += y;
+        count++;
+      }
+    }
+  }
+  if (count === 0) return { x: (boardWidth - 1) / 2, y: (boardHeight - 1) / 2 };
+  return { x: sumX / count, y: sumY / count };
+}
 
 function coordKey(x, y) {
   return `${x},${y}`;
@@ -169,6 +218,8 @@ function move(gameState) {
     const hazards = gameState.board.hazards || [];
     const food = gameState.board.food || [];
     const constrictor = isConstrictor(gameState);
+    const royale = isRoyale(gameState);
+    const P = getEffectiveParams(gameState);
 
     let isMoveSafe = { up: true, down: true, left: true, right: true };
 
@@ -205,8 +256,8 @@ function move(gameState) {
       // Only ever treat an enemy as "prey" (attackable) if we have a real length
       // advantage. Equal-length heads are always dangerous, never targets —
       // a 50/50 head-to-head isn't a fair fight worth picking.
-      const iAmClearlyBigger = myLength - snake.length >= PARAMS.MIN_LENGTH_ADVANTAGE;
-      const isDangerous = PARAMS.AVOID_EQUAL_LENGTH_HEADS
+      const iAmClearlyBigger = myLength - snake.length >= P.MIN_LENGTH_ADVANTAGE;
+      const isDangerous = P.AVOID_EQUAL_LENGTH_HEADS
         ? snake.length >= myLength || !iAmClearlyBigger
         : snake.length >= myLength;
 
@@ -286,21 +337,25 @@ function move(gameState) {
     });
 
     // Determine how urgently we want food this turn
-    const currentFoodDist = closestFoodDist(myHead, food);
     let foodUrgencyMultiplier = 0;
     if (!constrictor && food.length > 0) {
-      if (myHealth <= PARAMS.FOOD_URGENT_HEALTH) {
+      if (myHealth <= P.FOOD_URGENT_HEALTH) {
         // Scale urgency up as health drops further, so starving overrides almost everything
-        const healthRatio = 1 - (myHealth / PARAMS.FOOD_URGENT_HEALTH);
-        foodUrgencyMultiplier = PARAMS.FOOD_URGENT_MULTIPLIER * (1 + healthRatio);
-      } else if (myLength < PARAMS.FOOD_LENGTH_TARGET) {
+        const healthRatio = 1 - (myHealth / P.FOOD_URGENT_HEALTH);
+        foodUrgencyMultiplier = P.FOOD_URGENT_MULTIPLIER * (1 + healthRatio);
+      } else if (myLength < P.FOOD_LENGTH_TARGET) {
         foodUrgencyMultiplier = 1.5;
       } else {
         // Still meaningfully interested in nearby food even when big/healthy —
         // growth stays the dominant priority rather than dropping off a cliff
-        foodUrgencyMultiplier = PARAMS.FOOD_BASELINE_MULTIPLIER;
+        foodUrgencyMultiplier = P.FOOD_BASELINE_MULTIPLIER;
       }
     }
+
+    // Royale: precompute the safe-zone centroid once (not per-move) for the bias term below.
+    const safeZoneCenter = royale
+      ? getSafeZoneCenter(boardWidth, boardHeight, hazardSet)
+      : null;
 
     const scores = {};
     safeMoves.forEach(dir => {
@@ -310,28 +365,41 @@ function move(gameState) {
       const space = floodFill(targetX, targetY, boardWidth, boardHeight, occupied, hazardSet);
       const territory = getTerritoryControl({ x: targetX, y: targetY }, enemyHeads, boardWidth, boardHeight, occupied);
 
-      let score = (space * PARAMS.SPACE_WEIGHT) + (territory * PARAMS.TERRITORY_WEIGHT);
+      let score = (space * P.SPACE_WEIGHT) + (territory * P.TERRITORY_WEIGHT);
 
-      if (hazardSet.has(coordKey(targetX, targetY))) score -= PARAMS.HAZARD_PENALTY;
+      if (hazardSet.has(coordKey(targetX, targetY))) score -= P.HAZARD_PENALTY;
 
       if (ownBodyAdjacent.has(coordKey(targetX, targetY))) {
-        score -= Math.min(PARAMS.OWN_BODY_ADJACENT_MAX_PENALTY, space * 0.5);
+        score -= Math.min(P.OWN_BODY_ADJACENT_MAX_PENALTY, space * 0.5);
       }
 
-      if (preyHeadCells.has(coordKey(targetX, targetY))) score += PARAMS.PREY_HEAD_BONUS;
+      if (preyHeadCells.has(coordKey(targetX, targetY))) score += P.PREY_HEAD_BONUS;
 
       const centerX = (boardWidth - 1) / 2;
       const centerY = (boardHeight - 1) / 2;
       const distFromCenter = Math.abs(targetX - centerX) + Math.abs(targetY - centerY);
-      score -= distFromCenter * PARAMS.CENTER_BIAS_WEIGHT;
+      score -= distFromCenter * P.CENTER_BIAS_WEIGHT;
 
-      // Food: reward moves that reduce distance to the nearest food,
-      // but only meaningfully when the destination has enough breathing room.
-      if (foodUrgencyMultiplier > 0 && currentFoodDist !== null && space >= PARAMS.MIN_SAFE_SPACE) {
+      // Royale: the storm shrinks the board over time, so bias toward the
+      // centroid of currently-safe (non-hazard) cells rather than just the
+      // static board center — this tracks the safe zone as it moves/shrinks
+      // and helps avoid getting cornered as edges become hazardous.
+      if (royale) {
+        const distFromSafeZone = Math.abs(targetX - safeZoneCenter.x) + Math.abs(targetY - safeZoneCenter.y);
+        score -= distFromSafeZone * P.SAFE_ZONE_BIAS_WEIGHT;
+      }
+
+      // Food: use an inverse-distance potential field rather than a flat
+      // step bonus. A flat "+1 if closer / -1 if farther" bonus (the naive
+      // approach) gives an adjacent pellet the same weight as one 15 cells
+      // away, since a single move only ever changes distance by ~1. Scaling
+      // by 1/(distance+1) instead means nearby food pulls much harder than
+      // distant food, while still only mattering once there's room to move
+      // (MIN_SAFE_SPACE gate below).
+      if (foodUrgencyMultiplier > 0 && space >= P.MIN_SAFE_SPACE) {
         const newFoodDist = closestFoodDist({ x: targetX, y: targetY }, food);
         if (newFoodDist !== null) {
-          const improvement = currentFoodDist - newFoodDist; // positive if we got closer
-          score += improvement * PARAMS.FOOD_WEIGHT * foodUrgencyMultiplier;
+          score += foodUrgencyMultiplier * P.FOOD_WEIGHT / (newFoodDist + 1);
         }
       }
 
@@ -345,7 +413,7 @@ function move(gameState) {
     const nextMove = bestMoves[Math.floor(Math.random() * bestMoves.length)] || safeMoves[0];
 
     const execTime = Date.now() - startTime;
-    console.log(`MOVE ${gameState.turn}: ${nextMove} | Mode: ${constrictor ? "constrictor" : "standard"} | Len: ${myLength} | FoodUrgency: ${foodUrgencyMultiplier.toFixed(2)} | Took: ${execTime}ms`);
+    console.log(`MOVE ${gameState.turn}: ${nextMove} | Mode: ${constrictor ? "constrictor" : royale ? "royale" : "standard"} | Len: ${myLength} | FoodUrgency: ${foodUrgencyMultiplier.toFixed(2)} | Took: ${execTime}ms`);
     return { move: nextMove };
 
   } catch (error) {
