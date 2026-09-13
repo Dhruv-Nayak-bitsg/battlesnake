@@ -28,19 +28,28 @@ const DIRS = {
 };
 
 // Tunable parameters — adjust these to change personality
+// Overall priority split is roughly 60% growth (food) / 40% everything else
+// (space, territory, combat, positioning). See FOOD_WEIGHT / FOOD_URGENT_MULTIPLIER
+// vs SPACE_WEIGHT / TERRITORY_WEIGHT / PREY_HEAD_BONUS for the actual balance.
 const PARAMS = {
-  SPACE_WEIGHT: 10,
-  TERRITORY_WEIGHT: 5,
+  SPACE_WEIGHT: 7,
+  TERRITORY_WEIGHT: 3.5,
   HAZARD_PENALTY: 25,
   OWN_BODY_ADJACENT_MAX_PENALTY: 6,
-  PREY_HEAD_BONUS: 15,
   CENTER_BIAS_WEIGHT: 0.5,
-  // Food seeking
-  FOOD_WEIGHT: 3,            // score bonus per unit closer to food (scaled by urgency)
-  FOOD_URGENT_HEALTH: 40,    // health at/below this triggers urgent food-seeking
-  FOOD_URGENT_MULTIPLIER: 4, // multiplies FOOD_WEIGHT when health is low
-  FOOD_LENGTH_TARGET: 15,    // keep seeking food until this length, at reduced weight
-  MIN_SAFE_SPACE: 6,         // if the space behind a move is below this, food urgency is ignored
+
+  // Combat — only ever fight snakes we can actually beat
+  PREY_HEAD_BONUS: 8,         // reward for moving toward a weaker enemy's head (chip damage / trap opportunity)
+  MIN_LENGTH_ADVANTAGE: 2,    // must be at least this much LONGER than an enemy to treat it as prey/attackable
+  AVOID_EQUAL_LENGTH_HEADS: true, // treat equal-length enemy heads as dangerous, never as targets
+
+  // Food seeking — the dominant priority
+  FOOD_WEIGHT: 6,             // score bonus per unit closer to food (scaled by urgency)
+  FOOD_URGENT_HEALTH: 50,     // health at/below this triggers urgent food-seeking
+  FOOD_URGENT_MULTIPLIER: 6,  // multiplies FOOD_WEIGHT when health is low
+  FOOD_LENGTH_TARGET: 20,     // keep seeking food aggressively until this length
+  FOOD_BASELINE_MULTIPLIER: 1, // baseline food interest even when healthy/long (never fully stop growing)
+  MIN_SAFE_SPACE: 6,          // if the space behind a move is below this, food urgency is ignored
 };
 
 function coordKey(x, y) {
@@ -192,7 +201,14 @@ function move(gameState) {
       if (snake.id === gameState.you.id) return;
       const otherHead = snake.body[0];
       enemyHeads.push(otherHead);
-      const biggerOrEqual = snake.length >= myLength;
+
+      // Only ever treat an enemy as "prey" (attackable) if we have a real length
+      // advantage. Equal-length heads are always dangerous, never targets —
+      // a 50/50 head-to-head isn't a fair fight worth picking.
+      const iAmClearlyBigger = myLength - snake.length >= PARAMS.MIN_LENGTH_ADVANTAGE;
+      const isDangerous = PARAMS.AVOID_EQUAL_LENGTH_HEADS
+        ? snake.length >= myLength || !iAmClearlyBigger
+        : snake.length >= myLength;
 
       Object.values(DIRS).forEach(d => {
         const nx = otherHead.x + d.x;
@@ -202,8 +218,8 @@ function move(gameState) {
 
         if (occupied.has(key)) return;
 
-        if (biggerOrEqual) dangerHeadCells.add(key);
-        else preyHeadCells.add(key);
+        if (isDangerous) dangerHeadCells.add(key);
+        else if (iAmClearlyBigger) preyHeadCells.add(key);
       });
     });
 
@@ -278,10 +294,11 @@ function move(gameState) {
         const healthRatio = 1 - (myHealth / PARAMS.FOOD_URGENT_HEALTH);
         foodUrgencyMultiplier = PARAMS.FOOD_URGENT_MULTIPLIER * (1 + healthRatio);
       } else if (myLength < PARAMS.FOOD_LENGTH_TARGET) {
-        foodUrgencyMultiplier = 1;
+        foodUrgencyMultiplier = 1.5;
       } else {
-        // Still mildly interested in nearby food even when big/healthy
-        foodUrgencyMultiplier = 0.3;
+        // Still meaningfully interested in nearby food even when big/healthy —
+        // growth stays the dominant priority rather than dropping off a cliff
+        foodUrgencyMultiplier = PARAMS.FOOD_BASELINE_MULTIPLIER;
       }
     }
 
@@ -328,7 +345,7 @@ function move(gameState) {
     const nextMove = bestMoves[Math.floor(Math.random() * bestMoves.length)] || safeMoves[0];
 
     const execTime = Date.now() - startTime;
-    console.log(`MOVE ${gameState.turn}: ${nextMove} | Mode: ${constrictor ? "constrictor" : "standard"} | FoodUrgency: ${foodUrgencyMultiplier.toFixed(2)} | Took: ${execTime}ms`);
+    console.log(`MOVE ${gameState.turn}: ${nextMove} | Mode: ${constrictor ? "constrictor" : "standard"} | Len: ${myLength} | FoodUrgency: ${foodUrgencyMultiplier.toFixed(2)} | Took: ${execTime}ms`);
     return { move: nextMove };
 
   } catch (error) {
