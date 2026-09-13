@@ -4,7 +4,7 @@ function info() {
   return {
     apiversion: "1",
     author: "MySurvivalSnake",
-    color: "#f5a742",
+    color: "#2ec4b6",
     head: "beluga",
     tail: "curled",
   };
@@ -48,6 +48,7 @@ const PARAMS = {
   FOOD_URGENT_HEALTH: 50,     // health at/below this triggers urgent food-seeking
   FOOD_URGENT_MULTIPLIER: 6,  // multiplies FOOD_WEIGHT when health is low
   FOOD_LENGTH_TARGET: 20,     // keep seeking food aggressively until this length
+  FOOD_GROWTH_MULTIPLIER: 1.5, // urgency while under FOOD_LENGTH_TARGET but not low health
   FOOD_BASELINE_MULTIPLIER: 1, // baseline food interest even when healthy/long (never fully stop growing)
   MIN_SAFE_SPACE: 6,          // if the space behind a move is below this, food urgency is ignored
 };
@@ -83,14 +84,17 @@ function getEffectiveParams(gameState) {
   return isRoyale(gameState) ? { ...PARAMS, ...ROYALE_OVERRIDES } : PARAMS;
 }
 
-// Centroid of all currently-safe (non-hazard) board cells — this approximates
-// "where the shrinking storm is retreating to" far better than the board's
-// fixed geometric center, since the storm can shrink asymmetrically.
-function getSafeZoneCenter(boardWidth, boardHeight, hazardSet) {
+// Centroid of currently-safe, currently-open board cells (non-hazard AND
+// unoccupied) — this approximates "where the shrinking storm is retreating
+// to" far better than the board's fixed geometric center, since the storm
+// can shrink asymmetrically, and better than including occupied cells, which
+// would skew the target toward wherever snake bodies happen to be piled up.
+function getSafeZoneCenter(boardWidth, boardHeight, hazardSet, occupied) {
   let sumX = 0, sumY = 0, count = 0;
   for (let x = 0; x < boardWidth; x++) {
     for (let y = 0; y < boardHeight; y++) {
-      if (!hazardSet.has(coordKey(x, y))) {
+      const key = coordKey(x, y);
+      if (!hazardSet.has(key) && !occupied.has(key)) {
         sumX += x;
         sumY += y;
         count++;
@@ -127,6 +131,9 @@ function buildOccupied(gameState) {
   return occupied;
 }
 
+// Uses an index pointer instead of Array.shift(), which is O(n) per call and
+// would make this BFS effectively O(n^2) — costly since this runs up to 4x
+// per move, every move, for the whole match.
 function floodFill(startX, startY, boardWidth, boardHeight, occupied, hazardSet) {
   if (
     startX < 0 || startX >= boardWidth ||
@@ -138,10 +145,11 @@ function floodFill(startX, startY, boardWidth, boardHeight, occupied, hazardSet)
 
   const visited = new Set([coordKey(startX, startY)]);
   const queue = [{ x: startX, y: startY }];
+  let headIndex = 0;
   let space = 0;
 
-  while (queue.length > 0) {
-    const cur = queue.shift();
+  while (headIndex < queue.length) {
+    const cur = queue[headIndex++];
     const curKey = coordKey(cur.x, cur.y);
     space += hazardSet && hazardSet.has(curKey) ? 0.4 : 1;
 
@@ -184,7 +192,14 @@ function getTerritoryControl(myHead, enemyHeads, boardWidth, boardHeight, occupi
         continue;
       }
 
-      const minEnemyDist = Math.min(...enemyHeads.map(eh => manhattan(eh, target)));
+      // Plain loop instead of Math.min(...enemyHeads.map(...)) — avoids
+      // allocating a new array and spreading it for every empty cell on
+      // the board, every move.
+      let minEnemyDist = Infinity;
+      for (const eh of enemyHeads) {
+        const d = manhattan(eh, target);
+        if (d < minEnemyDist) minEnemyDist = d;
+      }
 
       if (myDist < minEnemyDist) myTerritory++;
     }
@@ -209,7 +224,7 @@ function move(gameState) {
 
   try {
     const myHead = gameState.you.body[0];
-    const myNeck = gameState.you.body[1];
+    const myNeck = gameState.you.body.length > 1 ? gameState.you.body[1] : null;
     const myLength = gameState.you.length;
     const myHealth = gameState.you.health;
     const boardWidth = gameState.board.width;
@@ -223,11 +238,13 @@ function move(gameState) {
 
     let isMoveSafe = { up: true, down: true, left: true, right: true };
 
-    // 1. Never reverse into your own neck
-    if (myNeck.x < myHead.x) isMoveSafe.left = false;
-    else if (myNeck.x > myHead.x) isMoveSafe.right = false;
-    else if (myNeck.y < myHead.y) isMoveSafe.down = false;
-    else if (myNeck.y > myHead.y) isMoveSafe.up = false;
+    // 1. Never reverse into your own neck (no-op if there's no neck yet, i.e. length 1)
+    if (myNeck) {
+      if (myNeck.x < myHead.x) isMoveSafe.left = false;
+      else if (myNeck.x > myHead.x) isMoveSafe.right = false;
+      else if (myNeck.y < myHead.y) isMoveSafe.down = false;
+      else if (myNeck.y > myHead.y) isMoveSafe.up = false;
+    }
 
     // 2. Never leave the board
     if (myHead.x === 0) isMoveSafe.left = false;
@@ -286,11 +303,11 @@ function move(gameState) {
 
     // Fallback Logic — no safe moves, pick least-bad option
     if (safeMoves.length === 0) {
-      const reverseDir = Object.keys(DIRS).find(dir => {
+      const reverseDir = myNeck ? Object.keys(DIRS).find(dir => {
         const nx = myHead.x + DIRS[dir].x;
         const ny = myHead.y + DIRS[dir].y;
         return nx === myNeck.x && ny === myNeck.y;
-      });
+      }) : null;
 
       const candidates = Object.keys(DIRS).filter(dir => {
         if (dir === reverseDir) return false;
@@ -344,7 +361,7 @@ function move(gameState) {
         const healthRatio = 1 - (myHealth / P.FOOD_URGENT_HEALTH);
         foodUrgencyMultiplier = P.FOOD_URGENT_MULTIPLIER * (1 + healthRatio);
       } else if (myLength < P.FOOD_LENGTH_TARGET) {
-        foodUrgencyMultiplier = 1.5;
+        foodUrgencyMultiplier = P.FOOD_GROWTH_MULTIPLIER;
       } else {
         // Still meaningfully interested in nearby food even when big/healthy —
         // growth stays the dominant priority rather than dropping off a cliff
@@ -354,7 +371,7 @@ function move(gameState) {
 
     // Royale: precompute the safe-zone centroid once (not per-move) for the bias term below.
     const safeZoneCenter = royale
-      ? getSafeZoneCenter(boardWidth, boardHeight, hazardSet)
+      ? getSafeZoneCenter(boardWidth, boardHeight, hazardSet, occupied)
       : null;
 
     const scores = {};
