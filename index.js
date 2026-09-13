@@ -27,6 +27,22 @@ const DIRS = {
   right: { x: 1, y: 0 },
 };
 
+// Tunable parameters — adjust these to change personality
+const PARAMS = {
+  SPACE_WEIGHT: 10,
+  TERRITORY_WEIGHT: 5,
+  HAZARD_PENALTY: 25,
+  OWN_BODY_ADJACENT_MAX_PENALTY: 6,
+  PREY_HEAD_BONUS: 15,
+  CENTER_BIAS_WEIGHT: 0.5,
+  // Food seeking
+  FOOD_WEIGHT: 3,            // score bonus per unit closer to food (scaled by urgency)
+  FOOD_URGENT_HEALTH: 40,    // health at/below this triggers urgent food-seeking
+  FOOD_URGENT_MULTIPLIER: 4, // multiplies FOOD_WEIGHT when health is low
+  FOOD_LENGTH_TARGET: 15,    // keep seeking food until this length, at reduced weight
+  MIN_SAFE_SPACE: 6,         // if the space behind a move is below this, food urgency is ignored
+};
+
 function coordKey(x, y) {
   return `${x},${y}`;
 }
@@ -97,40 +113,52 @@ function manhattan(a, b) {
 
 function getTerritoryControl(myHead, enemyHeads, boardWidth, boardHeight, occupied) {
   let myTerritory = 0;
-  
+
   for (let x = 0; x < boardWidth; x++) {
     for (let y = 0; y < boardHeight; y++) {
       if (occupied.has(coordKey(x, y))) continue;
-      
-      const target = {x, y};
+
+      const target = { x, y };
       const myDist = manhattan(myHead, target);
-      
+
       if (enemyHeads.length === 0) {
         myTerritory++;
         continue;
       }
-      
+
       const minEnemyDist = Math.min(...enemyHeads.map(eh => manhattan(eh, target)));
-      
+
       if (myDist < minEnemyDist) myTerritory++;
     }
   }
   return myTerritory;
 }
 
+function closestFoodDist(point, food) {
+  if (!food || food.length === 0) return null;
+  let min = Infinity;
+  food.forEach(f => {
+    const d = manhattan(point, f);
+    if (d < min) min = d;
+  });
+  return min;
+}
+
 // ---------- Main Move Logic ----------
 
 function move(gameState) {
-  const startTime = Date.now(); // Start performance timer
+  const startTime = Date.now();
 
   try {
     const myHead = gameState.you.body[0];
     const myNeck = gameState.you.body[1];
     const myLength = gameState.you.length;
+    const myHealth = gameState.you.health;
     const boardWidth = gameState.board.width;
     const boardHeight = gameState.board.height;
     const snakes = gameState.board.snakes;
     const hazards = gameState.board.hazards || [];
+    const food = gameState.board.food || [];
     const constrictor = isConstrictor(gameState);
 
     let isMoveSafe = { up: true, down: true, left: true, right: true };
@@ -157,8 +185,8 @@ function move(gameState) {
 
     // 4. Head-to-head danger
     const dangerHeadCells = new Set();
-    const preyHeadCells = new Set(); 
-    const enemyHeads = []; 
+    const preyHeadCells = new Set();
+    const enemyHeads = [];
 
     snakes.forEach(snake => {
       if (snake.id === gameState.you.id) return;
@@ -171,9 +199,9 @@ function move(gameState) {
         const ny = otherHead.y + d.y;
         if (nx < 0 || nx >= boardWidth || ny < 0 || ny >= boardHeight) return;
         const key = coordKey(nx, ny);
-        
+
         if (occupied.has(key)) return;
-        
+
         if (biggerOrEqual) dangerHeadCells.add(key);
         else preyHeadCells.add(key);
       });
@@ -189,7 +217,7 @@ function move(gameState) {
     let safeMoves = Object.keys(isMoveSafe).filter(key => isMoveSafe[key]);
     const hazardSet = new Set(hazards.map(h => coordKey(h.x, h.y)));
 
-    // Fallback Logic
+    // Fallback Logic — no safe moves, pick least-bad option
     if (safeMoves.length === 0) {
       const reverseDir = Object.keys(DIRS).find(dir => {
         const nx = myHead.x + DIRS[dir].x;
@@ -222,16 +250,16 @@ function move(gameState) {
       });
 
       ranked.sort((a, b) => b.rank - a.rank);
-      const fallback = ranked[0]?.dir || "up"; // Added ?. for ultimate safety
+      const fallback = ranked[0]?.dir || "up";
 
       const execTime = Date.now() - startTime;
       console.log(`MOVE ${gameState.turn}: Trapped! Defaulting to ${fallback}. (Took ${execTime}ms)`);
       return { move: fallback };
     }
 
-    // 5. Scoring with integrated Lookahead
+    // 5. Scoring — space, territory, and food are all combined here in one pass
     const ownBodyAdjacent = new Set();
-    gameState.you.body.slice(1).forEach(seg => { 
+    gameState.you.body.slice(1).forEach(seg => {
       Object.values(DIRS).forEach(d => {
         const nx = seg.x + d.x;
         const ny = seg.y + d.y;
@@ -241,77 +269,69 @@ function move(gameState) {
       });
     });
 
+    // Determine how urgently we want food this turn
+    const currentFoodDist = closestFoodDist(myHead, food);
+    let foodUrgencyMultiplier = 0;
+    if (!constrictor && food.length > 0) {
+      if (myHealth <= PARAMS.FOOD_URGENT_HEALTH) {
+        // Scale urgency up as health drops further, so starving overrides almost everything
+        const healthRatio = 1 - (myHealth / PARAMS.FOOD_URGENT_HEALTH);
+        foodUrgencyMultiplier = PARAMS.FOOD_URGENT_MULTIPLIER * (1 + healthRatio);
+      } else if (myLength < PARAMS.FOOD_LENGTH_TARGET) {
+        foodUrgencyMultiplier = 1;
+      } else {
+        // Still mildly interested in nearby food even when big/healthy
+        foodUrgencyMultiplier = 0.3;
+      }
+    }
+
     const scores = {};
     safeMoves.forEach(dir => {
       const targetX = myHead.x + DIRS[dir].x;
       const targetY = myHead.y + DIRS[dir].y;
 
       const space = floodFill(targetX, targetY, boardWidth, boardHeight, occupied, hazardSet);
-      const territory = getTerritoryControl({x: targetX, y: targetY}, enemyHeads, boardWidth, boardHeight, occupied);
+      const territory = getTerritoryControl({ x: targetX, y: targetY }, enemyHeads, boardWidth, boardHeight, occupied);
 
-      let score = (space * 10) + (territory * 5);
+      let score = (space * PARAMS.SPACE_WEIGHT) + (territory * PARAMS.TERRITORY_WEIGHT);
 
-      if (hazardSet.has(coordKey(targetX, targetY))) score -= 25;
+      if (hazardSet.has(coordKey(targetX, targetY))) score -= PARAMS.HAZARD_PENALTY;
 
       if (ownBodyAdjacent.has(coordKey(targetX, targetY))) {
-        score -= Math.min(6, space * 0.5);
+        score -= Math.min(PARAMS.OWN_BODY_ADJACENT_MAX_PENALTY, space * 0.5);
       }
 
-      if (preyHeadCells.has(coordKey(targetX, targetY))) score += 15;
+      if (preyHeadCells.has(coordKey(targetX, targetY))) score += PARAMS.PREY_HEAD_BONUS;
 
       const centerX = (boardWidth - 1) / 2;
       const centerY = (boardHeight - 1) / 2;
       const distFromCenter = Math.abs(targetX - centerX) + Math.abs(targetY - centerY);
-      score -= distFromCenter * 0.5;
+      score -= distFromCenter * PARAMS.CENTER_BIAS_WEIGHT;
+
+      // Food: reward moves that reduce distance to the nearest food,
+      // but only meaningfully when the destination has enough breathing room.
+      if (foodUrgencyMultiplier > 0 && currentFoodDist !== null && space >= PARAMS.MIN_SAFE_SPACE) {
+        const newFoodDist = closestFoodDist({ x: targetX, y: targetY }, food);
+        if (newFoodDist !== null) {
+          const improvement = currentFoodDist - newFoodDist; // positive if we got closer
+          score += improvement * PARAMS.FOOD_WEIGHT * foodUrgencyMultiplier;
+        }
+      }
 
       scores[dir] = score;
     });
 
     const maxScore = Math.max(...Object.values(scores));
-    let bestMoves = safeMoves.filter(dir => scores[dir] >= maxScore - 5);
+    let bestMoves = safeMoves.filter(dir => scores[dir] >= maxScore - 0.01);
     if (bestMoves.length === 0) bestMoves = safeMoves;
 
-    let nextMove = bestMoves[Math.floor(Math.random() * bestMoves.length)] || safeMoves[0];
-
-    // 6. Food seeking
-    if (!constrictor) {
-      const food = gameState.board.food;
-      if (food.length > 0) {
-        let closestFood = food[0];
-        let minFoodDist = Infinity;
-
-        food.forEach(f => {
-          const dist = manhattan(f, myHead);
-          if (dist < minFoodDist) {
-            minFoodDist = dist;
-            closestFood = f;
-          }
-        });
-
-        const lowHealth = gameState.you.health <= 40;
-        const shouldChaseFood = lowHealth || myLength < 12;
-
-        if (shouldChaseFood) {
-          let minMoveDist = Infinity;
-          bestMoves.forEach(dir => {
-            const targetX = myHead.x + DIRS[dir].x;
-            const targetY = myHead.y + DIRS[dir].y;
-            const distToFood = manhattan({ x: targetX, y: targetY }, closestFood);
-            if (distToFood < minMoveDist) {
-              minMoveDist = distToFood;
-              nextMove = dir;
-            }
-          });
-        }
-      }
-    }
+    const nextMove = bestMoves[Math.floor(Math.random() * bestMoves.length)] || safeMoves[0];
 
     const execTime = Date.now() - startTime;
-    console.log(`MOVE ${gameState.turn}: ${nextMove} | Mode: ${constrictor ? "constrictor" : "standard"} | Took: ${execTime}ms`);
+    console.log(`MOVE ${gameState.turn}: ${nextMove} | Mode: ${constrictor ? "constrictor" : "standard"} | FoodUrgency: ${foodUrgencyMultiplier.toFixed(2)} | Took: ${execTime}ms`);
     return { move: nextMove };
 
   } catch (error) {
-    // If the code breaks, print the exact error and send a safe default move
     const execTime = Date.now() - startTime;
     console.error(`💥 FATAL ERROR ON TURN ${gameState.turn} (after ${execTime}ms):`, error);
     return { move: "up" };
